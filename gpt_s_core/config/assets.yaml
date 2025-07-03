@@ -1,0 +1,135 @@
+# Konfigurasi Aset untuk Smart Money Concept Analyzer
+# --------------------------------------------------
+# Format:
+#   assets:
+#     - symbol: <simbol aset>
+#       type: <jenis aset>
+#       exchange: <bursa>
+#       parameters: <parameter khusus aset>
+#       timeframes: <timeframe yang dianalisis>
+#
+# Parameter khusus aset akan menimpa parameter global
+# Timeframe yang didukung: 1m, 5m, 15m, 30m, 1h, 4h, 1d, 1w
+
+global_parameters:
+  min_candles: 50
+  volume_multiplier: 2.5
+  fvg_min_strength: 0.5
+  liquidity_lookback: 20
+  swing_window: 5
+
+assets:
+  # Aset Kripto
+  - symbol: BTCUSDT
+    type: crypto
+    exchange: Binance
+    parameters:
+      min_candles: 100  # Lebih banyak candle untuk volatilitas tinggi
+      volume_multiplier: 2.0
+    timeframes:
+      - 15m
+      - 1h
+      - 4h
+      - 1d
+
+  - symbol: ETHUSDT
+    type: crypto
+    exchange: Binance
+    parameters:
+      fvg_min_strength: 0.4  # Lebih sensitif untuk ETH
+    timeframes:
+      - 15m
+      - 1h
+      - 4h
+
+  - symbol: SOLUSDT
+    type: crypto
+    exchange: Binance
+    timeframes:
+      - 5m
+      - 15m
+      - 1h
+
+  # Pasangan Forex
+  - symbol: EURUSD
+    type: forex
+    exchange: OANDA
+    parameters:
+      min_candles: 200  # Analisis lebih panjang untuk forex
+      liquidity_lookback: 50
+    timeframes:
+      - 30m
+      - 1h
+      - 4h
+      - 1d
+
+  - symbol: GBPJPY
+    type: forex
+    exchange: OANDA
+    parameters:
+      volume_multiplier: 3.0  # Volume lebih rendah di forex
+      swing_window: 7
+    timeframes:
+      - 1h
+      - 4h
+
+  # Saham
+  - symbol: AAPL
+    type: stock
+    exchange: NASDAQ
+    parameters:
+      min_candles: 75
+      fvg_min_strength: 0.6
+    timeframes:
+      - 1h
+      - 4h
+      - 1d
+
+  - symbol: TSLA
+    type: stock
+    exchange: NASDAQ
+    parameters:
+      volume_multiplier: 3.0
+      swing_window: 4
+    timeframes:
+      - 15m
+      - 1h
+      - 4h
+
+  # Indeks
+  - symbol: SPX500
+    type: index
+    exchange: NYSE
+    parameters:
+      min_candles: 200
+      liquidity_lookback: 40
+    timeframes:
+      - 4h
+      - 1d
+      - 1w
+
+  # Komoditas
+  - symbol: XAUUSD
+    type: commodity
+    exchange: COMEX
+    parameters:
+      fvg_min_strength: 0.3  # Emas sering memiliki FVG lebih kecil
+      volume_multiplier: 1.8
+    timeframes:
+      - 1h
+      - 4h
+      - 1d
+
+# Template untuk menambahkan aset baru:
+#  - symbol: 
+#    type: 
+#    exchange: 
+#    parameters:
+#      min_candles: 
+#      volume_multiplier: 
+#      fvg_min_strength: 
+#      liquidity_lookback: 
+#      swing_window: 
+#    timeframes:
+#      - 
+#      -

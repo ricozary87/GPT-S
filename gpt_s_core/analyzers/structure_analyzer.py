@@ -1,128 +1,345 @@
 import pandas as pd
+import pandas_ta as ta
+from typing import List, Dict, Optional, Tuple
+from dataclasses import dataclass
+import logging
+import numpy as np
+from collections import deque
 
-def detect_market_structure(candles: list) -> dict:
-    """
-    Deteksi struktur pasar (BOS, CHoCH) dari data candlestick OKX.
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('smc_analysis.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-    Fungsi ini mendeteksi BOS (Break of Structure) atau CHoCH (Change of Character)
-    berdasarkan perbandingan harga penutupan candlestick terbaru dengan
-    harga tertinggi (high) dan terendah (low) dari candlestick sebelumnya.
+@dataclass
+class MarketStructure:
+    recent_high: float
+    recent_low: float
+    current_close: float
+    bos: bool = False
+    choch: bool = False
+    fvg: Optional[Dict] = None
+    order_blocks: List[Dict] = None
+    liquidity: Optional[Dict] = None
+    volume_profile: Optional[Dict] = None
+    trend_structure: Optional[str] = None
+    swing_highs_lows: Optional[Dict] = None
 
-    Args:
-        candles (list): List dari data candlestick. Setiap elemen dalam list
-                        diharapkan berformat:
-                        [timestamp, open, high, low, close, volume, ...]
-                        Minimal harus ada 2 candlestick dalam list untuk deteksi.
+class SMAnalyzer:
+    def __init__(self, 
+                 min_candles: int = 50,
+                 volume_multiplier: float = 2.5,
+                 fvg_min_strength: float = 0.5,
+                 liquidity_lookback: int = 20):
+        """
+        Enhanced Smart Money Concept analyzer with additional features.
+        
+        Args:
+            min_candles: Minimum candles needed for reliable analysis
+            volume_multiplier: Volume threshold multiplier for order blocks
+            fvg_min_strength: Minimum percentage strength for valid FVG
+            liquidity_lookback: Number of candles to analyze for liquidity zones
+        """
+        self.min_candles = min_candles
+        self.volume_multiplier = volume_multiplier
+        self.fvg_min_strength = fvg_min_strength
+        self.liquidity_lookback = liquidity_lookback
+        self.recent_signals = deque(maxlen=100)  # Stores recent signals for pattern recognition
 
-    Returns:
-        dict: Kamus yang berisi informasi struktur pasar terbaru:
-              - "recent_high": Harga tertinggi dari candlestick sebelumnya.
-              - "recent_low": Harga terendah dari candlestick sebelumnya.
-              - "current_close": Harga penutupan dari candlestick terbaru.
-              - "bos": True jika terjadi Break of Structure, False jika tidak.
-              - "choch": True jika terjadi Change of Character, False jika tidak.
-              Mengembalikan nilai None untuk harga jika data tidak mencukupi.
-    """
-    # Pastikan ada setidaknya 2 candlestick untuk perbandingan
-    if len(candles) < 2:
-        print("Peringatan: Tidak ada cukup data candlestick (minimal 2 dibutuhkan) untuk mendeteksi struktur pasar.")
-        return {
-            "recent_high": None,
-            "recent_low": None,
-            "current_close": None,
-            "bos": False,
-            "choch": False
+    def _validate_data(self, candles: List) -> Optional[pd.DataFrame]:
+        """Validate and prepare candle data with enhanced checks."""
+        if len(candles) < self.min_candles:
+            logger.warning(f"Insufficient data: {len(candles)} candles (minimum {self.min_candles} required)")
+            return None
+
+        try:
+            df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "vol"])
+            
+            # Convert and validate numeric columns
+            numeric_cols = ["open", "high", "low", "close", "vol"]
+            df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
+            if df[numeric_cols].isnull().any().any():
+                logger.error("Invalid numeric data in candles")
+                return None
+                
+            # Validate timestamps
+            df["ts"] = pd.to_datetime(df["ts"], unit='ms', errors='coerce')
+            if df["ts"].isnull().any():
+                logger.error("Invalid timestamp data")
+                return None
+                
+            return df.iloc[::-1].reset_index(drop=True)  # Sort oldest to newest
+            
+        except Exception as e:
+            logger.error(f"Data validation failed: {str(e)}", exc_info=True)
+            return None
+
+    def detect_structure(self, candles: List) -> Optional[MarketStructure]:
+        """
+        Enhanced market structure detection with:
+        - More robust trend analysis
+        - Multiple order block detection
+        - Volume profile analysis
+        - Swing point identification
+        """
+        df = self._validate_data(candles)
+        if df is None:
+            return None
+
+        # Basic structure
+        structure = MarketStructure(
+            recent_high=df["high"].iloc[-2],
+            recent_low=df["low"].iloc[-2],
+            current_close=df["close"].iloc[-1],
+            order_blocks=[]
+        )
+
+        # Enhanced trend analysis
+        structure.trend_structure = self._detect_trend_structure(df)
+        
+        # Core SMC features
+        structure.bos = structure.current_close > structure.recent_high
+        structure.choch = (not structure.bos) and (structure.current_close < structure.recent_low)
+        
+        # Advanced features
+        structure.fvg = self._detect_strong_fvg(df)
+        structure.order_blocks = self._detect_multiple_order_blocks(df)
+        structure.liquidity = self._detect_liquidity_zones(df)
+        structure.volume_profile = self._analyze_volume_profile(df)
+        structure.swing_highs_lows = self._identify_swing_points(df)
+        
+        # Store this analysis for pattern recognition
+        self.recent_signals.append(structure)
+        
+        return structure
+
+    def _detect_trend_structure(self, df: pd.DataFrame) -> str:
+        """Determine the overall trend structure with confirmation."""
+        if len(df) < 20:  # Need enough data for trend analysis
+            return "neutral"
+            
+        # Use EMA cross for trend confirmation
+        df['ema_20'] = ta.ema(df['close'], length=20)
+        df['ema_50'] = ta.ema(df['close'], length=50)
+        
+        current_ema_trend = "up" if df['ema_20'].iloc[-1] > df['ema_50'].iloc[-1] else "down"
+        
+        # Check higher timeframe structure
+        swing_highs = df['high'].rolling(5, center=True).max() == df['high']
+        swing_lows = df['low'].rolling(5, center=True).min() == df['low']
+        
+        if current_ema_trend == "up" and any(swing_highs[-5:]):
+            return "uptrend"
+        elif current_ema_trend == "down" and any(swing_lows[-5:]):
+            return "downtrend"
+        return "range"
+
+    def _detect_strong_fvg(self, df: pd.DataFrame) -> Optional[Dict]:
+        """Detect only significant FVGs that meet strength criteria."""
+        if len(df) < 3:
+            return None
+
+        # Look for FVGs in recent candles
+        for i in range(1, min(5, len(df)-1)):
+            current_low = df["low"].iloc[-i]
+            prev_high = df["high"].iloc[-i-1]
+            
+            # Bullish FVG
+            if current_low > prev_high:
+                strength = (current_low - prev_high) / prev_high * 100
+                if strength >= self.fvg_min_strength:
+                    return {
+                        "type": "bullish",
+                        "range": (prev_high, current_low),
+                        "strength": strength,
+                        "age": i
+                    }
+
+            current_high = df["high"].iloc[-i]
+            prev_low = df["low"].iloc[-i-1]
+            
+            # Bearish FVG
+            if current_high < prev_low:
+                strength = (prev_low - current_high) / prev_low * 100
+                if strength >= self.fvg_min_strength:
+                    return {
+                        "type": "bearish",
+                        "range": (current_high, prev_low),
+                        "strength": strength,
+                        "age": i
+                    }
+        return None
+
+    def _detect_multiple_order_blocks(self, df: pd.DataFrame) -> List[Dict]:
+        """Detect multiple significant order blocks."""
+        blocks = []
+        if len(df) < 10:  # Need sufficient history
+            return blocks
+            
+        # Calculate volume thresholds
+        df['vol_ma'] = df['vol'].rolling(20).mean()
+        df['vol_upper'] = self.volume_multiplier * df['vol_ma']
+        
+        # Find all significant volume spikes
+        ob_candles = df[df['vol'] > df['vol_upper']].copy()
+        
+        for _, row in ob_candles.iterrows():
+            blocks.append({
+                "type": "bullish" if row['close'] > row['open'] else "bearish",
+                "range": (row['low'], row['high']),
+                "volume": row['vol'],
+                "timestamp": row['ts'],
+                "strength": row['vol'] / row['vol_ma']
+            })
+            
+        return blocks
+
+    def _detect_liquidity_zones(self, df: pd.DataFrame) -> Dict:
+        """Enhanced liquidity zone detection with volume confirmation."""
+        zones = {
+            "equal_highs": [],
+            "equal_lows": [],
+            "volume_clusters": []
         }
+        
+        if len(df) < self.liquidity_lookback:
+            return zones
+            
+        # Find equal highs and lows
+        high_counts = df['high'].value_counts()
+        low_counts = df['low'].value_counts()
+        
+        zones['equal_highs'] = [level for level, count in high_counts.items() 
+                              if count > 1 and level >= df['close'].iloc[-1]]
+        zones['equal_lows'] = [level for level, count in low_counts.items() 
+                             if count > 1 and level <= df['close'].iloc[-1]]
+        
+        # Volume-based liquidity zones
+        df['range'] = df['high'] - df['low']
+        df['poc'] = df['vol'] / df['range']  # Point of Control calculation
+        
+        # Get significant volume clusters
+        volume_threshold = df['poc'].quantile(0.7)
+        significant = df[df['poc'] > volume_threshold]
+        
+        for _, row in significant.iterrows():
+            zones['volume_clusters'].append({
+                'price_range': (row['low'], row['high']),
+                'volume': row['vol'],
+                'poc_strength': row['poc']
+            })
+            
+        return zones
 
-    # Buat DataFrame dari data candlestick
-    # Mengasumsikan kolom standar untuk candlestick (ts, open, high, low, close, vol)
-    # Tambahan kolom lain akan diabaikan jika tidak disebutkan.
-    # Jika ada kolom spesifik setelah 'vol' yang penting, Anda bisa menambahkannya di sini.
-    df = pd.DataFrame(candles, columns=["ts", "open", "high", "low", "close", "vol"] + [f"col{i}" for i in range(len(candles[0]) - 6)])
+    def _analyze_volume_profile(self, df: pd.DataFrame) -> Dict:
+        """Analyze volume profile for significant levels."""
+        profile = {
+            'high_volume_nodes': [],
+            'low_volume_nodes': []
+        }
+        
+        if len(df) < 20:
+            return profile
+            
+        # Simple volume profile analysis
+        bins = 20
+        price_range = df['high'].max() - df['low'].min()
+        bin_size = price_range / bins
+        
+        for i in range(bins):
+            price_level = df['low'].min() + i * bin_size
+            in_bin = (df['low'] <= price_level) & (df['high'] >= price_level)
+            vol_sum = df[in_bin]['vol'].sum()
+            
+            if vol_sum > df['vol'].quantile(0.75):
+                profile['high_volume_nodes'].append({
+                    'price_level': price_level,
+                    'volume': vol_sum
+                })
+            elif vol_sum < df['vol'].quantile(0.25):
+                profile['low_volume_nodes'].append({
+                    'price_level': price_level,
+                    'volume': vol_sum
+                })
+                
+        return profile
 
-    # Konversi kolom harga ke float untuk perhitungan yang akurat
-    df[["open", "high", "low", "close"]] = df[["open", "high", "low", "close"]].astype(float)
+    def _identify_swing_points(self, df: pd.DataFrame) -> Dict:
+        """Identify recent swing highs and lows."""
+        swings = {'highs': [], 'lows': []}
+        
+        if len(df) < 10:
+            return swings
+            
+        # Find swing highs (higher than neighbors)
+        highs = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(-1))
+        # Find swing lows (lower than neighbors)
+        lows = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(-1))
+        
+        for i, is_high in enumerate(highs):
+            if is_high:
+                swings['highs'].append({
+                    'price': df['high'].iloc[i],
+                    'timestamp': df['ts'].iloc[i],
+                    'strength': self._calculate_swing_strength(df, i, 'high')
+                })
+                
+        for i, is_low in enumerate(lows):
+            if is_low:
+                swings['lows'].append({
+                    'price': df['low'].iloc[i],
+                    'timestamp': df['ts'].iloc[i],
+                    'strength': self._calculate_swing_strength(df, i, 'low')
+                })
+                
+        return swings
 
-    # Urutkan DataFrame dari candlestick paling lama ke paling baru
-    # Ini penting agar iloc[-2] dan iloc[-1] merujuk ke data yang benar
-    df = df.iloc[::-1].reset_index(drop=True)
+    def _calculate_swing_strength(self, df: pd.DataFrame, idx: int, swing_type: str) -> float:
+        """Calculate how strong a swing point is."""
+        if swing_type == 'high':
+            left = max(0, idx-5)
+            right = min(len(df)-1, idx+5)
+            return df['high'].iloc[idx] / df['high'].iloc[left:right].mean() - 1
+        else:
+            left = max(0, idx-5)
+            right = min(len(df)-1, idx+5)
+            return 1 - df['low'].iloc[idx] / df['low'].iloc[left:right].mean()
 
-    # Ambil nilai yang relevan dari DataFrame
-    recent_high = df["high"].iloc[-2]      # High dari candlestick sebelumnya
-    recent_low = df["low"].iloc[-2]        # Low dari candlestick sebelumnya
-    current_close = df["close"].iloc[-1]   # Close dari candlestick terbaru
-
-    # Inisialisasi dictionary struktur pasar
-    structure = {
-        "recent_high": recent_high,
-        "recent_low": recent_low,
-        "current_close": current_close,
-        "bos": False,
-        "choch": False
-    }
-
-    # Deteksi Break of Structure (BOS)
-    # Jika harga penutupan terbaru lebih tinggi dari high candlestick sebelumnya
-    if current_close > recent_high:
-        structure["bos"] = True
-    # Deteksi Change of Character (CHoCH)
-    # Jika harga penutupan terbaru lebih rendah dari low candlestick sebelumnya
-    # Menggunakan 'elif' karena BOS dan CHoCH adalah kejadian eksklusif dalam logika ini
-    elif current_close < recent_low:
-        structure["choch"] = True
-
-    return structure
-
-# --- Contoh Penggunaan ---
-
-# Contoh data candlestick (format: [timestamp, open, high, low, close, volume, ...])
-# Data diurutkan dari yang paling baru ke paling lama seperti yang mungkin diterima dari API
-sample_candles_bullish_bos = [
-    [1719750400000, "100.0", "105.0", "99.0", "104.5", "1000", "extra1", "extra2"], # Candlestick Terbaru
-    [1719750300000, "98.0", "103.0", "97.0", "102.0", "950", "extra1", "extra2"],  # Candlestick Sebelumnya (recent_high 103.0, recent_low 97.0)
-    [1719750200000, "95.0", "99.0", "94.0", "98.0", "900", "extra1", "extra2"],
-]
-
-sample_candles_bearish_choch = [
-    [1719750400000, "100.0", "101.0", "94.0", "95.5", "1000", "extra1", "extra2"], # Candlestick Terbaru
-    [1719750300000, "98.0", "103.0", "97.0", "102.0", "950", "extra1", "extra2"],  # Candlestick Sebelumnya (recent_high 103.0, recent_low 97.0)
-    [1719750200000, "95.0", "99.0", "94.0", "98.0", "900", "extra1", "extra2"],
-]
-
-sample_candles_no_change = [
-    [1719750400000, "100.0", "102.0", "96.0", "100.0", "1000", "extra1", "extra2"], # Candlestick Terbaru
-    [1719750300000, "98.0", "103.0", "97.0", "102.0", "950", "extra1", "extra2"],  # Candlestick Sebelumnya (recent_high 103.0, recent_low 97.0)
-    [1719750200000, "95.0", "99.0", "94.0", "98.0", "900", "extra1", "extra2"],
-]
-
-sample_candles_insufficient = [
-    [1719750400000, "100.0", "105.0", "99.0", "104.5", "1000", "extra1", "extra2"],
-]
-
-sample_candles_empty = []
-
-
-print("--- Skenario BOS Bullish ---")
-result_bos = detect_market_structure(sample_candles_bullish_bos)
-print(result_bos)
-# Expected: {'recent_high': 103.0, 'recent_low': 97.0, 'current_close': 104.5, 'bos': True, 'choch': False}
-
-print("\n--- Skenario CHoCH Bearish ---")
-result_choch = detect_market_structure(sample_candles_bearish_choch)
-print(result_choch)
-# Expected: {'recent_high': 103.0, 'recent_low': 97.0, 'current_close': 95.5, 'bos': False, 'choch': True}
-
-print("\n--- Skenario Tidak Ada Perubahan Signifikan ---")
-result_no_change = detect_market_structure(sample_candles_no_change)
-print(result_no_change)
-# Expected: {'recent_high': 103.0, 'recent_low': 97.0, 'current_close': 100.0, 'bos': False, 'choch': False}
-
-print("\n--- Skenario Data Tidak Cukup (1 Candlestick) ---")
-result_insufficient = detect_market_structure(sample_candles_insufficient)
-print(result_insufficient)
-# Expected: Peringatan... {'recent_high': None, 'recent_low': None, 'current_close': None, 'bos': False, 'choch': False}
-
-print("\n--- Skenario Data Kosong ---")
-result_empty = detect_market_structure(sample_candles_empty)
-print(result_empty)
-# Expected: Peringatan... {'recent_high': None, 'recent_low': None, 'current_close': None, 'bos': False, 'choch': False}
+# Example Usage
+if __name__ == "__main__":
+    analyzer = SMAnalyzer(min_candles=30)
+    
+    # Generate test data
+    np.random.seed(42)
+    timestamps = pd.date_range(end=pd.Timestamp.now(), periods=100, freq='1H').astype(int) // 10**9 * 1000
+    closes = np.cumsum(np.random.randn(100) * 0.5 + 0.1) + 100
+    highs = closes + np.random.rand(100) * 2
+    lows = closes - np.random.rand(100) * 2
+    volumes = np.random.randint(100, 1000, size=100)
+    
+    test_candles = list(zip(
+        timestamps,
+        closes - 0.5,  # open
+        highs,
+        lows,
+        closes,
+        volumes
+    ))
+    
+    # Analyze structure
+    result = analyzer.detect_structure(test_candles)
+    
+    print("\n=== Enhanced Market Structure Analysis ===")
+    print(f"Trend Structure: {result.trend_structure}")
+    print(f"BOS: {result.bos} | CHoCH: {result.choch}")
+    print(f"Significant FVG: {result.fvg}")
+    print(f"Order Blocks Found: {len(result.order_blocks)}")
+    print(f"Liquidity Zones: {result.liquidity}")
+    print(f"Volume Profile Nodes: {len(result.volume_profile['high_volume_nodes'])} high, {len(result.volume_profile['low_volume_nodes'])} low")
+    print(f"Swing Points: {len(result.swing_highs_lows['highs'])} highs, {len(result.swing_highs_lows['lows'])} lows")

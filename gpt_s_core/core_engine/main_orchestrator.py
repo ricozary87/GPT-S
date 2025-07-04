@@ -1049,3 +1049,112 @@ class TestMainOrchestrator(unittest.TestCase):
         self.assertIn(test_message, call_args[0])
         self.assertIn("CRITICAL SYSTEM ALERT", call_args[0])
         logger.info("test_send_critical_alert PASSED.")
+
+    def test_configure_thread_pool(self):
+        """Test thread pool configuration based on system capacity."""
+        logger.info("Running test_configure_thread_pool...")
+        orchestrator = MainOrchestrator()
+        
+        # Test that thread pool is configured
+        self.assertIsNotNone(orchestrator.executor)
+        self.assertGreater(orchestrator.executor._max_workers, 1)
+        self.assertLessEqual(orchestrator.executor._max_workers, 8)
+        logger.info("test_configure_thread_pool PASSED.")
+
+    @patch('sqlite3.connect')
+    def test_checkpoint_signal_sqlite(self, mock_connect):
+        """Test SQLite checkpointing functionality."""
+        logger.info("Running test_checkpoint_signal_sqlite...")
+        
+        # Mock the database connection and cursor
+        mock_conn = MagicMock()
+        mock_connect.return_value.__enter__.return_value = mock_conn
+        
+        signal = TradingSignal(
+            symbol="BTC-USDT", signal_type="BOS", level=102.0, strength=0.5,
+            timestamp=int(time.time() * 1000), confidence=0.8, timeframe="15m", current_price=102.5
+        )
+        
+        self.orchestrator._checkpoint_signal(signal)
+        
+        # Verify SQLite operations were called
+        mock_conn.execute.assert_called()
+        mock_conn.commit.assert_called_once()
+        logger.info("test_checkpoint_signal_sqlite PASSED.")
+
+    def test_optimized_duplicate_detection(self):
+        """Test optimized duplicate signal detection using sets."""
+        logger.info("Running test_optimized_duplicate_detection...")
+        
+        signal_time = int(time.time() * 1000)
+        signal1 = TradingSignal(
+            symbol="BTC-USDT", signal_type="BOS", level=102.0, strength=0.5,
+            timestamp=signal_time, confidence=0.8, timeframe="15m", current_price=102.5
+        )
+        
+        # Test exact duplicate by signal_id
+        signal2 = TradingSignal(
+            symbol="BTC-USDT", signal_type="BOS", level=102.0, strength=0.5,
+            timestamp=signal_time, confidence=0.8, timeframe="15m", current_price=102.5
+        )
+        
+        recent_signals = deque([signal1], maxlen=100)
+        
+        # Should detect duplicate
+        is_duplicate = self.orchestrator.is_duplicate_signal(signal2, recent_signals)
+        self.assertTrue(is_duplicate)
+        
+        # Test non-duplicate with different level
+        signal3 = TradingSignal(
+            symbol="BTC-USDT", signal_type="BOS", level=105.0, strength=0.5,
+            timestamp=signal_time, confidence=0.8, timeframe="15m", current_price=105.5
+        )
+        
+        is_duplicate = self.orchestrator.is_duplicate_signal(signal3, recent_signals)
+        self.assertFalse(is_duplicate)
+        logger.info("test_optimized_duplicate_detection PASSED.")
+
+    def test_enhanced_data_validation(self):
+        """Test enhanced data validation in signal generation."""
+        logger.info("Running test_enhanced_data_validation...")
+        
+        # Test with NaN values
+        mock_analysis = MagicMock()
+        mock_analysis.current_close = float('nan')
+        mock_analysis.recent_high = 100.0
+        mock_analysis.recent_low = 95.0
+        
+        signals = self.orchestrator._generate_signals("BTC-USDT", "15m", mock_analysis)
+        self.assertEqual(len(signals), 0)  # Should return empty list for NaN values
+        
+        # Test with invalid price relationships
+        mock_analysis.current_close = 100.0
+        mock_analysis.recent_high = 95.0  # High < Low (invalid)
+        mock_analysis.recent_low = 100.0
+        
+        signals = self.orchestrator._generate_signals("BTC-USDT", "15m", mock_analysis)
+        self.assertEqual(len(signals), 0)  # Should return empty list for invalid relationships
+        logger.info("test_enhanced_data_validation PASSED.")
+
+    @patch.object(MainOrchestrator, '_handle_empty_data_fallback')
+    def test_fallback_mechanisms(self, mock_fallback):
+        """Test fallback mechanisms for various failure scenarios."""
+        logger.info("Running test_fallback_mechanisms...")
+        
+        with patch('__main__.get_ohlcv_data') as mock_get_data:
+            mock_get_data.return_value = None  # Empty data
+            
+            self.orchestrator.process_symbol("BTC-USDT", "15m")
+            mock_fallback.assert_called_once_with("BTC-USDT", "15m")
+        
+        logger.info("test_fallback_mechanisms PASSED.")
+
+
+if __name__ == "__main__":
+    # Set API credentials to avoid import errors during testing
+    import os
+    os.environ["OKX_API_KEY"] = "dummy_key"
+    os.environ["OKX_SECRET_KEY"] = "dummy_secret"
+    os.environ["OKX_PASSPHRASE"] = "dummy_passphrase"
+    
+    unittest.main(verbosity=2)

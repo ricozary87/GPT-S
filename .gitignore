@@ -13,3 +13,8 @@ ENV/
 
 # Secrets
 *.env
+venv/
+__pycache__/
+.env
+*.pyc
+*.log

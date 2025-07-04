@@ -1,4 +1,4 @@
-from data_sources.hyblock_fetcher import get_liquidation_levels
+from gpt_s_core.data_sources.hyblock_fetcher import get_liquidation_levels
 
 def test_hyblock():
     result = get_liquidation_levels()

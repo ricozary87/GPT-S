@@ -1,6 +1,6 @@
 # tests/test_structure.py
 
-from data_sources.okx_fetcher import get_candlesticks
+from gpt_s_core.data_sources.okx_fetcher import get_candlesticks
 from analyzers.structure_analyzer import detect_market_structure
 import logging
 import sys

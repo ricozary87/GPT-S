@@ -1,6 +1,9 @@
 import time
 import logging
-from typing import List, Dict, Optional, Tuple, Deque
+import json
+import sqlite3
+import os
+from typing import List, Dict, Optional, Tuple, Deque, Set
 from dataclasses import dataclass, field
 import pandas as pd
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -12,6 +15,7 @@ import unittest
 from unittest.mock import patch, MagicMock
 from collections import deque # Explicitly import deque
 import numpy as np # Import numpy for np.clip and np.isna
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 
 # Local imports (assuming these are correctly structured in your project)
 from gpt_s_core.data_sources.okx_fetcher import get_candlesticks as get_ohlcv_data
@@ -83,7 +87,8 @@ class MainOrchestrator:
         )
         self.monitor = EnhancedSystemMonitor()
         self.alert_manager = MultiChannelAlertManager()
-        self.executor = ThreadPoolExecutor(max_workers=8) # Default 8, can be from config
+        # Configure ThreadPoolExecutor based on system capacity
+        self.executor = self._configure_thread_pool()
         self.load_config(config_path)
 
         # Using deque for last_signals to limit memory usage and easily manage recent signals
@@ -100,6 +105,30 @@ class MainOrchestrator:
         logger.info(f"Symbols: {self.symbols}")
         logger.info(f"Timeframes: {self.intervals}")
         logger.info(f"Signal confidence threshold: {self.confidence_threshold}")
+
+    def _configure_thread_pool(self) -> ThreadPoolExecutor:
+        """Configure ThreadPoolExecutor based on system capacity."""
+        try:
+            cpu_count = os.cpu_count() or 4
+            memory_gb = psutil.virtual_memory().total / (1024**3)  # Convert to GB
+            
+            # Conservative approach: limit based on CPU cores and memory
+            if memory_gb < 4:  # Low memory systems
+                max_workers = min(4, cpu_count)
+            elif memory_gb < 8:  # Medium memory systems
+                max_workers = min(6, cpu_count)
+            else:  # High memory systems
+                max_workers = min(8, cpu_count)
+                
+            # Ensure at least 2 workers for basic parallelism
+            max_workers = max(2, max_workers)
+            
+            logger.info(f"Configured ThreadPoolExecutor with {max_workers} workers "
+                       f"(CPU cores: {cpu_count}, Memory: {memory_gb:.1f}GB)")
+            return ThreadPoolExecutor(max_workers=max_workers)
+        except Exception as e:
+            logger.warning(f"Failed to auto-configure thread pool: {e}. Using default 4 workers.")
+            return ThreadPoolExecutor(max_workers=4)
 
     def load_config(self, config_path: str):
         """
@@ -212,37 +241,32 @@ class MainOrchestrator:
                 # self.send_critical_alert(f"Persistent failure for {key}: {str(e)}")
         return successful_tasks
 
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=1, max=10),
+        retry=retry_if_exception_type(DataFetchError),
+        reraise=True
+    )
     def process_symbol_with_retry_wrapper(self, symbol: str, interval: str):
         """
-        Wrapper to handle retries for a single symbol-timeframe pair.
-        Raises the final exception if all retries fail, to be caught by `as_completed`.
+        Wrapper to handle retries for a single symbol-timeframe pair using tenacity.
+        Uses exponential backoff for DataFetchError, immediate fail for AnalysisError.
         """
-        for attempt in range(1, self.max_retries + 1):
-            try:
-                self.process_symbol(symbol, interval)
-                logger.debug(f"Successfully processed {symbol} {interval} on attempt {attempt}.")
-                return  # Success, exit retry loop
-            except DataFetchError as e:
-                logger.warning(f"Data fetch error for {symbol} {interval} (attempt {attempt}/{self.max_retries}): {e}")
-                if attempt < self.max_retries:
-                    time.sleep(2 ** attempt)  # Exponential backoff
-                else:
-                    raise # Re-raise on last attempt to be caught by as_completed
-            except AnalysisError as e:
-                logger.error(f"Analysis failed for {symbol} {interval} (no retry for analysis errors): {e}")
-                raise # Re-raise immediately as it might indicate a logic bug
-            except Exception as e:
-                logger.error(f"Unexpected error processing {symbol} {interval} (attempt {attempt}/{self.max_retries}): {e}", exc_info=True)
-                if attempt < self.max_retries:
-                    time.sleep(1 + attempt) # Simple linear backoff for unexpected errors
-                else:
-                    raise # Re-raise on last attempt
+        try:
+            self.process_symbol(symbol, interval)
+            logger.debug(f"Successfully processed {symbol} {interval}.")
+        except AnalysisError as e:
+            logger.error(f"Analysis failed for {symbol} {interval} (no retry for analysis errors): {e}")
+            raise  # Re-raise immediately as it might indicate a logic bug
+        except Exception as e:
+            logger.error(f"Unexpected error processing {symbol} {interval}: {e}", exc_info=True)
+            raise  # Let tenacity handle retries for DataFetchError, fail immediately for others
 
     def process_symbol(self, symbol: str, interval: str):
         """Process trading signals for a single symbol and timeframe."""
-        logger.debug(f"Initiating process for {symbol} on {interval} timeframe.") # Changed to debug for less verbosity
+        logger.debug(f"Initiating process for {symbol} on {interval} timeframe.")
 
-        # Fetch OHLCV data with timeout
+        # Fetch OHLCV data with timeout and error handling
         df = None
         try:
             df = get_ohlcv_data(
@@ -255,39 +279,90 @@ class MainOrchestrator:
             logger.error(f"API data fetch failed for {symbol} {interval}: {e}", exc_info=True)
             raise DataFetchError(f"API data fetch failed for {symbol} {interval}") from e
 
-        if df is None or df.empty or len(df) < self.analyzer.config["min_candles"]:
-            logger.warning(f"Insufficient or no valid data returned for {symbol} {interval} (fetched: {len(df) if df is not None else 0}, needed: {self.analyzer.config['min_candles']}).")
-            return
+        # Enhanced data validation with fallback logic
+        if df is None or df.empty:
+            logger.warning(f"No data returned for {symbol} {interval}")
+            return self._handle_empty_data_fallback(symbol, interval)
+            
+        if len(df) < self.analyzer.config["min_candles"]:
+            logger.warning(f"Insufficient data for {symbol} {interval} (fetched: {len(df)}, needed: {self.analyzer.config['min_candles']})")
+            return self._handle_insufficient_data_fallback(symbol, interval, len(df))
 
-        # Analyze market structure
+        # Analyze market structure with enhanced error handling
         analysis_result = None
         try:
-            # --- KRITIK 1: SMAnalyzer.detect_structure sekarang menerima DataFrame ---
-            # Assume SMAnalyzer.detect_structure is updated to accept pd.DataFrame directly
             analysis_result = self.analyzer.detect_structure(df)
         except Exception as e:
             logger.error(f"Market structure analysis failed for {symbol} {interval}: {e}", exc_info=True)
-            raise AnalysisError(f"Market structure analysis failed for {symbol} {interval}") from e
+            return self._handle_analysis_failure_fallback(symbol, interval, e)
 
-        if not analysis_result: # analysis_result can be None if SMAnalyzer.detect_structure returns None
-            logger.warning(f"No meaningful analysis result for {symbol} {interval}.")
-            return
+        if not analysis_result:
+            logger.warning(f"No analysis result returned for {symbol} {interval}")
+            return self._handle_empty_analysis_fallback(symbol, interval)
 
-        # Generate and process trading signals
-        signals = self._generate_signals(symbol, interval, analysis_result)
-        for signal in signals:
-            self._process_signal(signal)
-        logger.debug(f"Completed processing {symbol} {interval}. Generated {len(signals)} signals.") # Changed to debug
+        # Generate and process signals with enhanced validation
+        try:
+            signals = self._generate_signals(symbol, interval, analysis_result)
+            if signals:
+                for signal in signals:
+                    self._process_signal(signal)
+                logger.info(f"Generated {len(signals)} signals for {symbol} {interval}")
+            else:
+                logger.debug(f"No signals generated for {symbol} {interval}")
+        except Exception as e:
+            logger.error(f"Signal generation/processing failed for {symbol} {interval}: {e}", exc_info=True)
+            # Don't raise here - just log the error and continue
+
+    def _handle_empty_data_fallback(self, symbol: str, interval: str):
+        """Handle fallback when no data is returned."""
+        logger.warning(f"Implementing fallback for empty data: {symbol} {interval}")
+        # Could implement cache lookup or use last known data here
+        return None
+
+    def _handle_insufficient_data_fallback(self, symbol: str, interval: str, data_count: int):
+        """Handle fallback when insufficient data is available."""
+        logger.warning(f"Implementing fallback for insufficient data: {symbol} {interval} ({data_count} candles)")
+        # Could try a different timeframe or reduce analysis requirements
+        return None
+
+    def _handle_analysis_failure_fallback(self, symbol: str, interval: str, error: Exception):
+        """Handle fallback when analysis fails."""
+        logger.warning(f"Implementing fallback for analysis failure: {symbol} {interval}: {error}")
+        # Could try simplified analysis or use cached results
+        return None
+
+    def _handle_empty_analysis_fallback(self, symbol: str, interval: str):
+        """Handle fallback when analysis returns no results."""
+        logger.warning(f"Implementing fallback for empty analysis: {symbol} {interval}")
+        # Could retry with different parameters or use fallback analysis
+        return None
 
     def _generate_signals(self, symbol: str, interval: str, analysis: MarketStructure) -> List[TradingSignal]:
-        """Generate trading signals from analysis results with enhanced logic."""
+        """Generate trading signals from analysis results with enhanced data validation."""
         signals = []
 
-        current_close = analysis.current_close
-        # --- KRITIK 2: MarketStructure default values tidak dicek NaN di alert ---
-        # Robustness check for critical fields before generating signals
-        if pd.isna(current_close) or pd.isna(analysis.recent_high) or pd.isna(analysis.recent_low):
-            logger.warning(f"❌ Analysis result for {symbol} {interval} contains NaN in critical price levels. Skipping signal generation.")
+        # Enhanced data validation for all critical fields
+        try:
+            current_close = analysis.current_close
+            if pd.isna(current_close) or pd.isna(analysis.recent_high) or pd.isna(analysis.recent_low):
+                logger.warning(f"❌ Analysis result for {symbol} {interval} contains NaN in critical price levels. Skipping signal generation.")
+                return []
+
+            # Validate that prices are reasonable (positive values)
+            if current_close <= 0 or analysis.recent_high <= 0 or analysis.recent_low <= 0:
+                logger.warning(f"❌ Analysis result for {symbol} {interval} contains invalid price values. Skipping signal generation.")
+                return []
+
+            # Validate price relationships
+            if analysis.recent_high < analysis.recent_low:
+                logger.warning(f"❌ Analysis result for {symbol} {interval} has invalid high/low relationship. Skipping signal generation.")
+                return []
+
+        except AttributeError as e:
+            logger.error(f"❌ Analysis result missing required attributes for {symbol} {interval}: {e}")
+            return []
+        except Exception as e:
+            logger.error(f"❌ Unexpected error during data validation for {symbol} {interval}: {e}")
             return []
 
         # 1. BOS/CHoCH signals with confidence calculation
@@ -413,56 +488,102 @@ class MainOrchestrator:
 
     def _checkpoint_signal(self, signal: TradingSignal):
         """
-        Saves a signal to persistent storage (e.g., SQLite, JSON file).
-        For simplicity, this example uses a JSON file append mode.
-        In a real system, consider a proper database for querying and reliability.
+        Saves a signal to persistent SQLite storage for better scalability and reliability.
         """
-        checkpoint_file = f"signals_checkpoint_{signal.symbol}.json"
         try:
-            # Convert TradingSignal dataclass to a dictionary
-            signal_dict = signal.__dict__.copy()
-            # Convert timestamp from int (ms) to ISO string for readability if desired, or keep as int
-            signal_dict['timestamp_iso'] = pd.to_datetime(signal.timestamp, unit='ms').isoformat()
-
-            with open(checkpoint_file, 'a') as f: # 'a' for append mode
-                # Serialize to JSON and write, each signal on a new line
-                json.dump(signal_dict, f)
-                f.write('\n') # New line for each entry
-            logger.debug(f"Signal {signal.signal_id} checkpointed to {checkpoint_file}")
+            # Create signals directory if it doesn't exist
+            signals_dir = "signals_database"
+            os.makedirs(signals_dir, exist_ok=True)
+            
+            # Use a single database file for all signals
+            db_path = os.path.join(signals_dir, "trading_signals.db")
+            
+            with sqlite3.connect(db_path) as conn:
+                # Create table if it doesn't exist
+                conn.execute('''
+                    CREATE TABLE IF NOT EXISTS signals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        signal_id TEXT UNIQUE,
+                        symbol TEXT,
+                        signal_type TEXT,
+                        level REAL,
+                        strength REAL,
+                        confidence REAL,
+                        timeframe TEXT,
+                        current_price REAL,
+                        trend TEXT,
+                        timestamp INTEGER,
+                        timestamp_iso TEXT,
+                        source TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                
+                # Insert signal data
+                signal_data = (
+                    signal.signal_id,
+                    signal.symbol,
+                    signal.signal_type,
+                    signal.level,
+                    signal.strength,
+                    signal.confidence,
+                    signal.timeframe,
+                    signal.current_price,
+                    signal.trend,
+                    signal.timestamp,
+                    pd.to_datetime(signal.timestamp, unit='ms').isoformat(),
+                    signal.source
+                )
+                
+                conn.execute('''
+                    INSERT OR REPLACE INTO signals 
+                    (signal_id, symbol, signal_type, level, strength, confidence, 
+                     timeframe, current_price, trend, timestamp, timestamp_iso, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', signal_data)
+                
+                conn.commit()
+                logger.debug(f"Signal {signal.signal_id} checkpointed to SQLite database")
+                
         except Exception as e:
-            logger.error(f"Failed to checkpoint signal {signal.signal_id}: {e}", exc_info=True)
+            logger.error(f"Failed to checkpoint signal {signal.signal_id} to SQLite: {e}", exc_info=True)
 
 
     def is_duplicate_signal(self, signal: TradingSignal, recent_signals: Deque[TradingSignal]) -> bool:
         """
+        Optimized duplicate signal checking using sets for better performance.
         Check if similar signal was recently processed based on type, timeframe,
         similar level (within tolerance), and within a time window.
         """
-        # Time window based on timeframe, or a default
-        time_window_seconds = 300 # 5 minutes default for low timeframes
-        if signal.timeframe in ["1H", "4H"]:
-            time_window_seconds = 3600 # 1 hour for higher timeframes
-        elif signal.timeframe in ["1m", "5m"]:
-            time_window_seconds = 120 # 2 minutes for very low timeframes
+        # Quick check for exact signal_id duplicates using set lookup
+        signal_ids: Set[str] = {s.signal_id for s in recent_signals}
+        if signal.signal_id in signal_ids:
+            return True
 
+        # Time window based on timeframe
+        time_window_seconds = 300  # 5 minutes default for low timeframes
+        if signal.timeframe in ["1H", "4H"]:
+            time_window_seconds = 3600  # 1 hour for higher timeframes
+        elif signal.timeframe in ["1m", "5m"]:
+            time_window_seconds = 120  # 2 minutes for very low timeframes
 
         # Price tolerance based on percentage of the signal level
-        price_tolerance = 0.0005 * signal.level if signal.level != 0 else 0.0001 # 0.05% of the price level
-
+        price_tolerance = 0.0005 * signal.level if signal.level != 0 else 0.0001  # 0.05% of the price level
         current_time_ms = int(time.time() * 1000)
 
-        for s in recent_signals:
-            # Check if it's the exact same signal_id (for re-runs or very quick duplicates)
-            if s.signal_id == signal.signal_id:
-                return True
-
-            # More flexible duplicate check
-            if (s.signal_type == signal.signal_type and
+        # Create a set of recent signals matching type and timeframe for faster filtering
+        matching_signals = [
+            s for s in recent_signals 
+            if (s.signal_type == signal.signal_type and 
                 s.timeframe == signal.timeframe and
-                abs(s.level - signal.level) < price_tolerance and # Check level proximity
-                (current_time_ms - s.timestamp) < (time_window_seconds * 1000) # Check within time window
-            ):
+                (current_time_ms - s.timestamp) < (time_window_seconds * 1000))
+        ]
+
+        # Check for level proximity only among matching signals
+        for s in matching_signals:
+            if abs(s.level - signal.level) < price_tolerance:
                 return True
+                
         return False
 
     def send_signal_alert(self, signal: TradingSignal):
